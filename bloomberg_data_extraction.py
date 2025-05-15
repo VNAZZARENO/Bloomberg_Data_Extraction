@@ -13,10 +13,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class BloombergDataExtractor:
-    def __init__(self, base_dir, extraction_mode='partial'):
+    def __init__(self, base_dir, extraction_mode='partial', convert_currency=True):
         self.base_dir = base_dir
         self.output_dir = os.path.join(base_dir, "data")
         self.extraction_mode = extraction_mode
+        self.convert_currency = convert_currency
         self.today = dt.datetime.today()
         if extraction_mode == 'full':
             self.start_date = self.today - timedelta(days=15 * 365)  
@@ -66,6 +67,57 @@ class BloombergDataExtractor:
             'SX5E': 'GTDEM10Y Govt',
             'FTSE': 'GUKG10 Index',
         }
+        
+        # Market suffix to currency mapping
+        self.market_to_currency = {
+            # Eurozone markets (EUR)
+            'FP': 'EUR',  # Paris
+            'GY': 'EUR',  # Germany
+            'IM': 'EUR',  # Italy
+            'SM': 'EUR',  # Spain
+            'NA': 'EUR',  # Netherlands
+            'BB': 'EUR',  # Brussels
+            'AV': 'EUR',  # Vienna
+            'ID': 'EUR',  # Ireland
+            'PL': 'EUR',  # Portugal
+            'GA': 'EUR',  # Greece
+            'FH': 'EUR',  # Finland
+            
+            # Non-Eurozone European markets
+            'LN': 'GBP',  # London
+            'SS': 'SEK',  # Sweden
+            'NO': 'NOK',  # Norway
+            'DC': 'DKK',  # Denmark
+            'SW': 'CHF',  # Switzerland
+            'PW': 'PLN',  # Poland
+            'CP': 'CZK',  # Czech Republic
+            'HB': 'HUF',  # Hungary
+            
+            # Americas
+            'US': 'USD',  # United States
+            'UN': 'USD',  # United States (NASDAQ)
+            'UW': 'USD',  # United States (NYSE)
+            'CN': 'CAD',  # Canada
+            'BZ': 'BRL',  # Brazil
+            'MM': 'MXN',  # Mexico
+            
+            # Asia-Pacific
+            'JT': 'JPY',  # Japan
+            'KS': 'KRW',  # South Korea
+            'CH': 'CNY',  # China (Shanghai)
+            'HK': 'HKD',  # Hong Kong
+            'SP': 'SGD',  # Singapore
+            'TT': 'TWD',  # Taiwan
+            'AU': 'AUD',  # Australia
+            'NZ': 'NZD',  # New Zealand
+            'IT': 'INR',  # India
+        }
+        
+        # Currency pairs for conversion to EUR
+        self.currency_pairs = {}
+        for currency in set(self.market_to_currency.values()):
+            if currency != 'EUR':
+                self.currency_pairs[currency] = f'EUR{currency} Curncy'
         
         os.makedirs(self.output_dir, exist_ok=True)
     
@@ -167,6 +219,11 @@ class BloombergDataExtractor:
             logger.warning("Empty dataframe, skipping save")
             return
         
+        # Get exchange rates if currency conversion is enabled
+        fx_rates = None
+        if self.convert_currency:
+            fx_rates = self.get_exchange_rates()
+        
         df.index.name = 'Dates'
         if isinstance(df.columns, pd.MultiIndex):
             for field in field_mappings.keys():
@@ -174,6 +231,16 @@ class BloombergDataExtractor:
                     field_data = df.xs(field, axis=1, level=1).copy() 
                     field_data = field_data.ffill()
                     field_data.index.name = 'Dates'
+                    
+                    # Apply currency conversion for price data
+                    if field == 'PX_LAST' and self.convert_currency and fx_rates is not None:
+                        field_data = self.apply_currency_conversion(field_data, fx_rates)
+                        
+                        # Save both original and EUR-normalized data
+                        file_path_orig = os.path.join(save_dir, 'price_original.csv')
+                        orig_data = self.merge_with_existing_data(df.xs(field, axis=1, level=1).copy().ffill(), file_path_orig)
+                        orig_data.to_csv(file_path_orig, sep=";", date_format='%d/%m/%Y')
+                        logger.info(f"Saved original {field} data to {file_path_orig}")
                     
                     file_path = os.path.join(save_dir, field_mappings[field])
                     field_data = self.merge_with_existing_data(field_data, file_path)
@@ -187,6 +254,17 @@ class BloombergDataExtractor:
             
             df = df.ffill()
             df.index.name = 'Dates'
+            
+            # Apply currency conversion if this is price data
+            if self.convert_currency and fx_rates is not None:
+                # Save original data before conversion
+                file_path_orig = os.path.join(save_dir, 'price_original.csv')
+                orig_df = self.merge_with_existing_data(df.copy(), file_path_orig)
+                orig_df.to_csv(file_path_orig, sep=';', date_format='%d/%m/%Y')
+                logger.info(f"Saved original data to {file_path_orig}")
+                
+                # Apply conversion
+                df = self.apply_currency_conversion(df, fx_rates)
             
             file_path = os.path.join(save_dir, 'price.csv')
             df = self.merge_with_existing_data(df, file_path)
@@ -238,6 +316,77 @@ class BloombergDataExtractor:
         
         return df
     
+    def get_exchange_rates(self):
+        """Extract exchange rate data for currency conversion"""
+        if not self.convert_currency:
+            return None
+            
+        logger.info("Extracting exchange rate data for currency conversion")
+        currency_tickers = list(self.currency_pairs.values())
+        
+        if not currency_tickers:
+            logger.warning("No currency pairs defined for conversion")
+            return None
+            
+        df = self.extract_data_for_universe(currency_tickers, ['PX_LAST'])
+        
+        if df.empty:
+            logger.warning("No exchange rate data extracted")
+            return None
+            
+        if isinstance(df.columns, pd.MultiIndex):
+            rate_df = df.xs('PX_LAST', axis=1, level=1)
+        else:
+            rate_df = df
+            
+        rate_df = rate_df.ffill()
+        
+        # Save exchange rates to file
+        fx_output_dir = os.path.join(self.output_dir, 'fx_rates')
+        os.makedirs(fx_output_dir, exist_ok=True)
+        
+        rate_df.index.name = 'Dates'
+        fx_file_path = os.path.join(fx_output_dir, 'exchange_rates.csv')
+        rate_df = self.merge_with_existing_data(rate_df, fx_file_path)
+        rate_df.to_csv(fx_file_path, sep=";", date_format='%d/%m/%Y')
+        logger.info(f"Saved exchange rate data to {fx_file_path}")
+        
+        return rate_df
+        
+    def apply_currency_conversion(self, price_df, fx_rates_df):
+        """Apply currency conversion to price data to normalize to EUR"""
+        if not self.convert_currency or fx_rates_df is None or price_df.empty:
+            return price_df
+            
+        logger.info("Applying currency conversion to normalize prices to EUR")
+        
+        # Create a copy to avoid modifying the original
+        converted_df = price_df.copy()
+        
+        # Process each ticker in the price dataframe
+        for ticker in converted_df.columns:
+            # Extract market suffix (e.g., 'LN' from 'VOD LN Equity')
+            parts = ticker.split()
+            if len(parts) >= 2 and ' Equity' in ticker:
+                market_suffix = parts[-2]
+                
+                # Get currency for this market
+                currency = self.market_to_currency.get(market_suffix)
+                
+                if currency and currency != 'EUR':
+                    fx_ticker = self.currency_pairs.get(currency)
+                    
+                    if fx_ticker and fx_ticker in fx_rates_df.columns:
+                        logger.info(f"Converting {ticker} from {currency} to EUR using {fx_ticker}")
+                        
+                        # For EUR/XXX pairs, we need to divide by the rate
+                        # This converts from local currency to EUR
+                        converted_df[ticker] = converted_df[ticker] / fx_rates_df[fx_ticker]
+                    else:
+                        logger.warning(f"Exchange rate not available for {currency} to EUR conversion")
+        
+        return converted_df
+    
     def extract_risk_proxies(self):
         """Extract risk proxy data"""
         logger.info("Starting risk proxies extraction")
@@ -259,6 +408,13 @@ class BloombergDataExtractor:
         
         combined_df = combined_df.ffill()
         combined_df.index.name = 'Dates'
+        
+        # Apply currency conversion if enabled
+        if self.convert_currency:
+            fx_rates = self.get_exchange_rates()
+            if fx_rates is not None:
+                combined_df = self.apply_currency_conversion(combined_df, fx_rates)
+        
         combined_file_path = os.path.join(risk_output_dir, 'all_risk_proxies.csv')
         combined_df = self.merge_with_existing_data(combined_df, combined_file_path)
         combined_df.to_csv(combined_file_path, sep=";", date_format='%d/%m/%Y')
@@ -292,12 +448,15 @@ def main():
                        help='Extraction mode (full: 15Y, partial: 100d)')
     parser.add_argument('--base-dir', default=r"X:\Stagiaires\Vincent N\data",
                        help='Base directory for data storage')
+    parser.add_argument('--no-currency-conversion', action='store_true',
+                       help='Disable currency conversion to EUR')
     
     args = parser.parse_args()
     
-    extractor = BloombergDataExtractor(args.base_dir, args.mode)
+    convert_currency = not args.no_currency_conversion
+    extractor = BloombergDataExtractor(args.base_dir, args.mode, convert_currency)
     
-    logger.info(f"Starting extraction: target={args.target}, mode={args.mode}")
+    logger.info(f"Starting extraction: target={args.target}, mode={args.mode}, currency_conversion={convert_currency}")
     if args.target == 'sxxp':
         extractor.extract_index_universe_data('SXXP')
     elif args.target == 'spx':
