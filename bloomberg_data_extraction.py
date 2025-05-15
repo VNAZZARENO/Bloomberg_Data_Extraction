@@ -113,7 +113,6 @@ class BloombergDataExtractor:
             'IT': 'INR',  # India
         }
         
-        # Currency pairs for conversion to EUR
         self.currency_pairs = {}
         for currency in set(self.market_to_currency.values()):
             if currency != 'EUR':
